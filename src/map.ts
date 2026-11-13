@@ -1,25 +1,9 @@
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { SPACES, SPACE_COLORS, toLngLat } from './board';
+import { SPACES, PATHS, LANDMARKS, CENTER, SPACE_COLORS, type Branch } from './board';
 
 // OpenFreeMap: OpenStreetMap-Vektorkacheln inkl. 3D-Gebäuden, ohne API-Key.
 const STYLE = 'https://tiles.openfreemap.org/styles/liberty';
-
-export interface GeoResult {
-  lng: number;
-  lat: number;
-  label: string;
-}
-
-/** Adresse -> Koordinaten über Nominatim (OpenStreetMap). */
-export async function geocode(query: string): Promise<GeoResult | null> {
-  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=de&q=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Geocoding fehlgeschlagen (${res.status})`);
-  const data = (await res.json()) as { lon: string; lat: string; display_name: string }[];
-  if (!data.length) return null;
-  return { lng: +data[0].lon, lat: +data[0].lat, label: data[0].display_name };
-}
 
 const TOKEN_OFFSETS: [number, number][] = [
   [-16, -8],
@@ -28,194 +12,237 @@ const TOKEN_OFFSETS: [number, number][] = [
   [16, 14],
 ];
 
+const M_LAT = 111320;
+const M_LNG = 111320 * Math.cos((CENTER[1] * Math.PI) / 180);
+
+/** Kreis (bzw. Ellipse) in Metern um einen Punkt, als Polygon-Ring */
+function ring(lng: number, lat: number, rx: number, ry = rx, steps = 28): [number, number][] {
+  return Array.from({ length: steps + 1 }, (_, i) => {
+    const a = (i / steps) * Math.PI * 2;
+    return [lng + (Math.cos(a) * rx) / M_LNG, lat + (Math.sin(a) * ry) / M_LAT] as [number, number];
+  });
+}
+
 export class CityMap {
   readonly map: maplibregl.Map;
   readonly ready: Promise<void>;
-  coords: [number, number][] = [];
+  readonly coords: [number, number][] = SPACES.map((s) => [s.lng, s.lat]);
   private tokens: { marker: maplibregl.Marker; inner: HTMLElement }[] = [];
   private fruit?: maplibregl.Marker;
-  private eventMarkers: maplibregl.Marker[] = [];
-  private origFilters = new Map<string, unknown>();
+  private choiceMarkers: maplibregl.Marker[] = [];
 
   constructor(container: string) {
     this.map = new maplibregl.Map({
       container,
       style: STYLE,
-      center: [13.3777, 52.5163],
-      zoom: 15.5,
-      pitch: 60,
+      center: CENTER,
+      zoom: 14.6,
+      pitch: 58,
       bearing: -20,
       maxPitch: 75,
       canvasContextAttributes: { antialias: true },
     });
     this.ready = new Promise((resolve) =>
       this.map.once('load', () => {
-        this.candyTheme();
+        this.partyTheme();
+        this.buildBoard();
         resolve();
       }),
     );
   }
 
-  /** Lila Abendhimmel + bonbonfarbene Gebäude für den bunten Party-Look. */
-  private candyTheme() {
+  /** Blauer Himmel, sattgrüne Wiesen und bonbonfarbene Häuser: Neuhof als Spielzeugwelt. */
+  private partyTheme() {
     const map = this.map;
     try {
       map.setSky({
-        'sky-color': '#2a1466',
-        'horizon-color': '#ff8fc7',
-        'fog-color': '#b79cff',
-        'sky-horizon-blend': 0.7,
-        'horizon-fog-blend': 0.6,
-        'fog-ground-blend': 0.3,
+        'sky-color': '#3fa9ff',
+        'horizon-color': '#d9f3ff',
+        'fog-color': '#c9f0c0',
+        'sky-horizon-blend': 0.6,
+        'horizon-fog-blend': 0.5,
+        'fog-ground-blend': 0.2,
       });
       for (const layer of map.getStyle().layers) {
-        if (layer.type === 'background') map.setPaintProperty(layer.id, 'background-color', '#c4ee9f');
-        if (layer.type === 'fill' && /residential|landuse_res/.test(layer.id)) {
-          map.setPaintProperty(layer.id, 'fill-color', '#d3f2ae');
+        if (layer.type === 'background') map.setPaintProperty(layer.id, 'background-color', '#8fdc6a');
+        if (layer.type === 'fill' && /residential|landuse_res|industrial|commercial/.test(layer.id)) {
+          map.setPaintProperty(layer.id, 'fill-color', '#a5e67c');
         }
+        // Ortsnamen & Co. ausblenden – das Brett bringt eigene Schilder mit
+        if (layer.type === 'symbol') map.setLayoutProperty(layer.id, 'visibility', 'none');
         if (layer.type !== 'fill-extrusion') continue;
         map.setPaintProperty(layer.id, 'fill-extrusion-color', [
           'interpolate',
           ['linear'],
           ['coalesce', ['get', 'render_height'], 8],
           0, '#ffd6e8',
-          10, '#ffe9a8',
-          20, '#ffb3a7',
-          35, '#a9def9',
-          60, '#d0b8ff',
-          120, '#ff9ecf',
+          6, '#ffe9a8',
+          10, '#ffb3a7',
+          16, '#a9def9',
+          30, '#d0b8ff',
         ]);
         map.setPaintProperty(layer.id, 'fill-extrusion-opacity', 0.95);
+        map.setFilter(layer.id, ['>', ['distance', { type: 'MultiLineString', coordinates: PATHS }], 7] as any);
       }
     } catch (err) {
       console.warn('Party-Look konnte nicht gesetzt werden', err);
     }
   }
 
-  /** Baut das (feste) Spielbrett rund um die Koordinate in die echte Stadt. */
-  async setCenter(lng: number, lat: number, leftPadding = 0) {
-    await this.ready;
+  /** Legt Wege, 3D-Felder, Schilder und den Monte Kali auf die Karte. */
+  private buildBoard() {
     const map = this.map;
-    this.coords = SPACES.map((s) => toLngLat(lng, lat, s.x, s.y));
-
-    const path = {
-      type: 'Feature' as const,
-      properties: {},
-      geometry: { type: 'LineString' as const, coordinates: [...this.coords, this.coords[0]] },
-    };
-    const points = {
-      type: 'FeatureCollection' as const,
-      features: this.coords.map((c, i) => ({
-        type: 'Feature' as const,
-        properties: { type: SPACES[i].type },
-        geometry: { type: 'Point' as const, coordinates: c },
-      })),
-    };
 
     // Pixelbreite so skalieren, dass sie einer festen Breite in Metern entspricht.
     const meters = (m: number) => {
-      const px = (z: number) => (m * 2 ** z) / (78271.5 * Math.cos((lat * Math.PI) / 180));
+      const px = (z: number) => (m * 2 ** z) / (78271.5 * Math.cos((CENTER[1] * Math.PI) / 180));
       return ['interpolate', ['exponential', 2], ['zoom'], 10, px(10), 22, px(22)] as any;
     };
 
-    for (const id of ['board-spaces', 'board-path', 'board-path-casing']) {
-      if (map.getLayer(id)) map.removeLayer(id);
-    }
-    for (const id of ['board-path', 'board-spaces']) {
-      if (map.getSource(id)) map.removeSource(id);
-    }
-    map.addSource('board-path', { type: 'geojson', data: path });
-    map.addSource('board-spaces', { type: 'geojson', data: points });
+    map.addSource('board-path', {
+      type: 'geojson',
+      data: { type: 'Feature', properties: {}, geometry: { type: 'MultiLineString', coordinates: PATHS } },
+    });
     map.addLayer({
       id: 'board-path-casing',
       type: 'line',
       source: 'board-path',
       layout: { 'line-join': 'round', 'line-cap': 'round' },
-      paint: { 'line-color': '#4c1d95', 'line-width': meters(17) },
+      paint: { 'line-color': '#b45309', 'line-width': meters(17) },
     });
     map.addLayer({
       id: 'board-path',
       type: 'line',
       source: 'board-path',
       layout: { 'line-join': 'round', 'line-cap': 'round' },
-      paint: { 'line-color': '#fde68a', 'line-width': meters(12) },
+      paint: { 'line-color': '#ffd93d', 'line-width': meters(12) },
+    });
+
+    // Felder: weißer Sockel + farbige Scheibe, als echte 3D-Körper
+    const disc = (r: number, h: number, base: number) => ({
+      type: 'FeatureCollection' as const,
+      features: SPACES.map((s) => ({
+        type: 'Feature' as const,
+        properties: { color: SPACE_COLORS[s.type], h, base },
+        geometry: { type: 'Polygon' as const, coordinates: [ring(s.lng, s.lat, r)] },
+      })),
+    });
+    map.addSource('board-rim', { type: 'geojson', data: disc(13, 1.2, 0) });
+    map.addSource('board-spaces', { type: 'geojson', data: disc(10.5, 2.6, 1.2) });
+    map.addLayer({
+      id: 'board-rim',
+      type: 'fill-extrusion',
+      source: 'board-rim',
+      paint: { 'fill-extrusion-color': '#fffdf5', 'fill-extrusion-height': ['get', 'h'] },
     });
     map.addLayer({
       id: 'board-spaces',
-      type: 'circle',
+      type: 'fill-extrusion',
       source: 'board-spaces',
       paint: {
-        'circle-pitch-alignment': 'map',
-        'circle-pitch-scale': 'map',
-        'circle-radius': meters(9),
-        'circle-stroke-width': meters(2),
-        'circle-stroke-color': '#ffffff',
-        'circle-color': [
-          'match',
-          ['get', 'type'],
-          'start', SPACE_COLORS.start,
-          'red', SPACE_COLORS.red,
-          'event', SPACE_COLORS.event,
-          SPACE_COLORS.blue,
-        ],
+        'fill-extrusion-color': ['get', 'color'],
+        'fill-extrusion-height': ['get', 'h'],
+        'fill-extrusion-base': ['get', 'base'],
+        'fill-extrusion-vertical-gradient': false,
       },
     });
 
-    this.clearBuildingsAlong(path);
-
-    this.eventMarkers.forEach((m) => m.remove());
-    this.eventMarkers = [];
-    SPACES.forEach((s, i) => {
-      if (s.type !== 'event' && s.type !== 'start') return;
-      const el = document.createElement('div');
-      el.className = 'space-icon';
-      el.textContent = s.type === 'event' ? '❓' : '🏁';
-      this.eventMarkers.push(new maplibregl.Marker({ element: el }).setLngLat(this.coords[i]).addTo(map));
+    // Monte Kali: der weiße Kaliberg als Stufenkegel am Horizont
+    const kali = LANDMARKS.find((l) => l.name === 'Monte Kali')!;
+    map.addSource('kali', {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features: Array.from({ length: 9 }, (_, i) => ({
+          type: 'Feature' as const,
+          properties: { h: 22 * (i + 1), base: 22 * i, color: i > 6 ? '#ffffff' : i % 2 ? '#f3efe6' : '#e6e0d4' },
+          geometry: {
+            type: 'Polygon' as const,
+            coordinates: [ring(kali.lng, kali.lat, 520 - i * 52, 380 - i * 38, 40)],
+          },
+        })),
+      },
+    });
+    map.addLayer({
+      id: 'kali',
+      type: 'fill-extrusion',
+      source: 'kali',
+      paint: {
+        'fill-extrusion-color': ['get', 'color'],
+        'fill-extrusion-height': ['get', 'h'],
+        'fill-extrusion-base': ['get', 'base'],
+      },
     });
 
+    SPACES.forEach((s, i) => {
+      const icon = s.type === 'event' ? '❓' : s.type === 'start' ? '🏁' : s.next.length > 1 ? '🔀' : '';
+      if (!icon) return;
+      const el = document.createElement('div');
+      el.className = 'space-icon';
+      el.textContent = icon;
+      new maplibregl.Marker({ element: el }).setLngLat(this.coords[i]).addTo(map);
+    });
+
+    for (const l of LANDMARKS) {
+      const el = document.createElement('div');
+      el.className = 'landmark';
+      el.innerHTML = `<span>${l.emoji}</span><b>${l.name}</b>`;
+      new maplibregl.Marker({ element: el, anchor: 'bottom' }).setLngLat([l.lng, l.lat]).addTo(map);
+    }
+  }
+
+  /** Entfernt Spielfiguren und Obst (für eine neue Partie). */
+  reset() {
     this.tokens.forEach((t) => t.marker.remove());
     this.tokens = [];
     this.fruit?.remove();
     this.fruit = undefined;
-
-    this.overview(leftPadding);
-  }
-
-  /** Blendet 3D-Gebäude direkt auf der Strecke aus, damit das Brett als Schneise durch die Stadt läuft. */
-  private clearBuildingsAlong(path: unknown) {
-    const map = this.map;
-    for (const layer of map.getStyle().layers) {
-      if (layer.type !== 'fill-extrusion') continue;
-      if (!this.origFilters.has(layer.id)) this.origFilters.set(layer.id, map.getFilter(layer.id) ?? null);
-      const orig = this.origFilters.get(layer.id);
-      const far = ['>', ['distance', path], 16];
-      try {
-        map.setFilter(layer.id, (orig ? ['all', orig, far] : far) as any);
-      } catch (err) {
-        console.warn('Gebäudefilter nicht anwendbar', err);
-      }
-    }
+    this.clearChoices();
   }
 
   overview(leftPadding = 0, duration = 3000) {
     const bounds = new maplibregl.LngLatBounds();
     this.coords.forEach((c) => bounds.extend(c));
     this.map.fitBounds(bounds, {
-      padding: { top: 90, bottom: 90, right: 60, left: 60 + leftPadding },
-      pitch: 55,
+      padding: { top: 70, bottom: 70, right: 50, left: 50 + leftPadding },
+      pitch: 52,
       bearing: -20,
       duration,
     });
   }
 
-  focus(space: number, duration = 700) {
+  focus(space: number, duration = 700, zoom = 17) {
     this.map.easeTo({
       center: this.coords[space],
-      zoom: 17.3,
+      zoom,
       pitch: 62,
       bearing: this.map.getBearing() + 3,
       duration,
     });
+  }
+
+  /** Zeigt an einer Abzweigung anklickbare Wegweiser auf den Folgefeldern. */
+  showChoices(options: Branch[], pick: (index: number) => void) {
+    this.clearChoices();
+    options.forEach((o, i) => {
+      // Äußeres Element gehört MapLibre (Position), die Animation liegt auf dem inneren Knopf
+      const el = document.createElement('div');
+      el.style.zIndex = '6';
+      const btn = document.createElement('button');
+      btn.className = 'choice-pin';
+      btn.textContent = o.icon;
+      btn.title = o.label;
+      btn.addEventListener('click', () => pick(i));
+      el.append(btn);
+      this.choiceMarkers.push(
+        new maplibregl.Marker({ element: el, anchor: 'bottom', offset: [0, -10] }).setLngLat(this.coords[o.to]).addTo(this.map),
+      );
+    });
+  }
+
+  clearChoices() {
+    this.choiceMarkers.forEach((m) => m.remove());
+    this.choiceMarkers = [];
   }
 
   addToken(index: number, emoji: string, color: string, space: number) {

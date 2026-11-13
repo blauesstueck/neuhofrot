@@ -1,7 +1,7 @@
 import './style.css';
 import { CHARACTERS, type Character } from './characters';
 import { SPACES, START_COINS, FRUIT_PRICE, BLUE_COINS, RED_COINS, LAP_BONUS, MINIGAME_PRIZE } from './board';
-import { CityMap, geocode } from './map';
+import { CityMap } from './map';
 import { runMinigame } from './minigames';
 
 interface Player {
@@ -21,6 +21,9 @@ const rand = (n: number) => Math.floor(Math.random() * n);
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
 const panelPadding = () => (window.innerWidth > 900 ? 440 : 0);
 
+// Zum Testen: ?feld=3 startet alle Spieler auf Feld 3 statt am Rathaus.
+const DEBUG_START = Math.min(SPACES.length - 1, Math.max(0, +(new URLSearchParams(location.search).get('feld') ?? 0) || 0));
+
 // ---------------------------------------------------------------- Setup
 
 const setup = {
@@ -28,69 +31,27 @@ const setup = {
   names: ['Niklas', 'Morris', 'Spieler 3', 'Spieler 4'],
   chars: [0, 1, 2, 3],
   rounds: 8,
-  located: '',
 };
 
 function renderSetup() {
   overlay.innerHTML = `
     <div class="panel setup">
-      <h1 class="logo"><span>Rotten</span> <span>Party</span> 🍍</h1>
-      <p class="sub">Das Brainrot-Brettspiel mitten durch deine Stadt</p>
+      <h1 class="logo"><span>Neuhofrot</span> <span>Party</span> 🍍</h1>
+      <p class="sub">Das Brainrot-Brettspiel mitten durch 36119 Neuhof</p>
 
-      <h3>1 · Wo wird gespielt?</h3>
-      <form id="addr-form" class="row">
-        <input id="addr" type="text" placeholder="Adresse oder Ort eingeben…" value="Brandenburger Tor, Berlin" autocomplete="off" />
-        <button class="btn" type="submit">Bauen</button>
-      </form>
-      <div id="addr-status" class="status">Gib eine Adresse ein – das Spielfeld wird live dort gebaut.</div>
-
-      <h3>2 · Wer spielt mit?</h3>
+      <h3>1 · Wer spielt mit?</h3>
       <div class="row seg" id="count">
         ${[2, 3, 4].map((n) => `<button type="button" data-n="${n}">${n} Spieler</button>`).join('')}
       </div>
       <div id="players"></div>
 
-      <h3>3 · Wie lange?</h3>
+      <h3>2 · Wie lange?</h3>
       <div class="row seg" id="rounds">
         ${[5, 8, 12].map((n) => `<button type="button" data-n="${n}">${n} Runden</button>`).join('')}
       </div>
 
       <button class="btn primary big-btn" id="start">Party starten!</button>
     </div>`;
-
-  const status = overlay.querySelector<HTMLElement>('#addr-status')!;
-  const addr = overlay.querySelector<HTMLInputElement>('#addr')!;
-
-  const locate = async (): Promise<boolean> => {
-    const q = addr.value.trim();
-    if (!q) {
-      status.textContent = 'Bitte erst eine Adresse eingeben.';
-      return false;
-    }
-    if (q === setup.located) return true;
-    status.textContent = '🔎 Suche Adresse…';
-    try {
-      const hit = await geocode(q);
-      if (!hit) {
-        status.textContent = '❌ Adresse nicht gefunden – versuch es genauer.';
-        return false;
-      }
-      status.textContent = '🏗️ Baue Spielfeld…';
-      await city.setCenter(hit.lng, hit.lat, panelPadding());
-      setup.located = q;
-      status.textContent = `✅ ${hit.label}`;
-      return true;
-    } catch (err) {
-      console.error(err);
-      status.textContent = '❌ Adresssuche gerade nicht erreichbar.';
-      return false;
-    }
-  };
-
-  overlay.querySelector('#addr-form')!.addEventListener('submit', (e) => {
-    e.preventDefault();
-    void locate();
-  });
 
   const syncSeg = () => {
     overlay.querySelectorAll<HTMLElement>('#count button').forEach((b) => b.classList.toggle('sel', +b.dataset.n! === setup.count));
@@ -149,15 +110,13 @@ function renderSetup() {
   overlay.querySelector('#start')!.addEventListener('click', async (e) => {
     const btn = e.currentTarget as HTMLButtonElement;
     btn.disabled = true;
-    const ok = await locate();
-    btn.disabled = false;
-    if (!ok) return;
+    await city.ready;
     const players: Player[] = Array.from({ length: setup.count }, (_, i) => ({
       name: setup.names[i].trim() || `Spieler ${i + 1}`,
       char: CHARACTERS[setup.chars[i]],
       coins: START_COINS,
       fruits: 0,
-      pos: 0,
+      pos: DEBUG_START,
     }));
     overlay.innerHTML = '';
     void playGame(players, setup.rounds);
@@ -182,6 +141,7 @@ async function playGame(players: Player[], rounds: number) {
     <div class="hud-action">
       <div id="msg"></div>
       <div id="dice"></div>
+      <div id="branch" class="row center"></div>
       <button class="btn primary" id="roll" hidden>🎲 Würfeln</button>
     </div>`;
   const msgEl = hud.querySelector<HTMLElement>('#msg')!;
@@ -249,6 +209,34 @@ async function playGame(players: Player[], rounds: number) {
       window.addEventListener('keydown', onKey);
     });
 
+  const branchEl = hud.querySelector<HTMLElement>('#branch')!;
+  /** Abzweigung: Spieler wählt per Knopf, Wegweiser auf der Karte oder Zifferntaste. */
+  const chooseBranch = (p: Player) =>
+    new Promise<number>((resolve) => {
+      const options = SPACES[p.pos].next;
+      say(`🔀 ${esc(p.name)}, wohin soll's gehen?`);
+      city.focus(p.pos, 600, 16.2);
+      const done = (i: number) => {
+        branchEl.innerHTML = '';
+        city.clearChoices();
+        window.removeEventListener('keydown', onKey);
+        resolve(options[i].to);
+      };
+      const onKey = (e: KeyboardEvent) => {
+        const i = +e.key - 1;
+        if (i >= 0 && i < options.length) done(i);
+      };
+      branchEl.innerHTML = options
+        .map((o, i) => `<button class="btn ${i === 0 ? 'primary' : ''}" data-b="${i}">${o.icon} ${esc(o.label)}</button>`)
+        .join('');
+      branchEl.onclick = (e) => {
+        const b = (e.target as HTMLElement).closest<HTMLElement>('[data-b]');
+        if (b) done(+b.dataset.b!);
+      };
+      city.showChoices(options, done);
+      window.addEventListener('keydown', onKey);
+    });
+
   const moveFruit = async (avoid: number) => {
     let next = fruitSpace;
     while (next === fruitSpace || next === avoid || next === 0) next = 1 + rand(SPACES.length - 1);
@@ -281,16 +269,31 @@ async function playGame(players: Player[], rounds: number) {
     const others = players.filter((o) => o !== p);
     const events: (() => Promise<void> | void)[] = [
       () => {
-        say(`🎰 Jackpot! ${esc(p.name)} bekommt 10 🪙`);
+        say(`⛰️ Salz-Jackpot am Monte Kali! ${esc(p.name)} bekommt 10 🪙`);
         addCoins(p, 10);
       },
       () => {
-        say(`💸 Pech! ${esc(p.name)} verliert 5 🪙`);
+        say(`🥨 Die Bäckerei spendiert eine Runde: ${esc(p.name)} bekommt 6 🪙`);
+        addCoins(p, 6);
+      },
+      () => {
+        say(`🛒 Großeinkauf im Supermarkt! ${esc(p.name)} verliert 5 🪙`);
         addCoins(p, -5);
       },
       () => {
-        say(`✈️ Bombardiro-Angriff! Alle anderen verlieren 3 🪙`);
+        say(`🚂 Zug verpasst am Bahnhof Neuhof – ${esc(p.name)} zahlt 4 🪙 fürs Taxi`);
+        addCoins(p, -4);
+      },
+      () => {
+        say(`✈️ Bombardiro-Angriff über Neuhof! Alle anderen verlieren 3 🪙`);
         others.forEach((o) => addCoins(o, -3));
+      },
+      async () => {
+        say(`🚒 Die Feuerwehr fährt ${esc(p.name)} zurück zum Rathaus: +${LAP_BONUS} 🪙`);
+        p.pos = 0;
+        await city.moveToken(players.indexOf(p), 0, 1100);
+        addCoins(p, LAP_BONUS);
+        city.focus(0);
       },
       () => {
         const victim = [...others].sort((a, b) => b.coins - a.coins)[0];
@@ -340,12 +343,13 @@ async function playGame(players: Player[], rounds: number) {
     await sleep(600);
 
     for (let left = n; left > 0; left--) {
-      p.pos = (p.pos + 1) % SPACES.length;
+      const options = SPACES[p.pos].next;
+      p.pos = options.length > 1 ? await chooseBranch(p) : options[0].to;
       city.focus(p.pos, 320);
       await city.moveToken(i, p.pos);
       diceEl.textContent = left > 1 ? String(left - 1) : '';
       if (p.pos === 0) {
-        say(`🏁 Runde geschafft: +${LAP_BONUS} 🪙`);
+        say(`🏁 Am Rathaus vorbei: +${LAP_BONUS} 🪙`);
         addCoins(p, LAP_BONUS);
         await sleep(700);
       }
@@ -369,7 +373,8 @@ async function playGame(players: Player[], rounds: number) {
   };
 
   // --- Ablauf
-  players.forEach((p, i) => city.addToken(i, p.char.emoji, p.char.color, 0));
+  city.reset();
+  players.forEach((p, i) => city.addToken(i, p.char.emoji, p.char.color, p.pos));
   renderHud();
   say('Die Party beginnt! 🎉');
   city.overview(0, 1500);
@@ -424,9 +429,11 @@ async function playGame(players: Player[], rounds: number) {
       </div>
     </div>`;
   overlay.querySelector('#again')!.addEventListener('click', () => {
-    setup.located = '';
+    city.reset();
+    city.overview(panelPadding());
     renderSetup();
   });
 }
 
 renderSetup();
+void city.ready.then(() => city.overview(panelPadding(), 4000));
