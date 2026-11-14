@@ -1,5 +1,6 @@
 export interface MiniPlayer {
   name: string;
+  /** Figur als SVG-Markup */
   emoji: string;
   color: string;
 }

@@ -146,13 +146,13 @@ function renderSetup() {
       return `
         <div class="player-pick" style="--c:${me.color}">
           <div class="row">
-            <span class="avatar">${me.emoji}</span>
+            <span class="avatar">${me.art}</span>
             <input class="name" data-i="${i}" maxlength="14" value="${esc(setup.names[i])}" />
           </div>
           <div class="chips">
             ${CHARACTERS.map((c, ci) => {
               const taken = setup.chars.slice(0, setup.count).some((x, j) => x === ci && j !== i);
-              return `<button type="button" class="chip ${ci === setup.chars[i] ? 'sel' : ''}" data-i="${i}" data-c="${ci}" title="${c.name}" ${taken ? 'disabled' : ''}>${c.emoji}</button>`;
+              return `<button type="button" class="chip ${ci === setup.chars[i] ? 'sel' : ''}" data-i="${i}" data-c="${ci}" title="${c.name}" ${taken ? 'disabled' : ''}>${c.art}</button>`;
             }).join('')}
           </div>
           <div class="char-name">${me.name}</div>
@@ -218,7 +218,7 @@ async function playGame(players: Player[], rounds: number) {
       .map(
         (p, i) => `
         <div class="card ${i === current ? 'active' : ''}" style="--c:${p.char.color}">
-          <span class="avatar">${p.char.emoji}</span>
+          <span class="avatar">${p.char.art}</span>
           <div>
             <div class="card-name">${esc(p.name)}</div>
             <div class="card-stats"><span>🪙 ${p.coins}</span><span>🍍 ${p.fruits}</span></div>
@@ -440,7 +440,7 @@ async function playGame(players: Player[], rounds: number) {
 
   // --- Ablauf
   city.reset();
-  players.forEach((p, i) => city.addToken(i, p.char.emoji, p.char.color, p.pos));
+  players.forEach((p, i) => city.addToken(i, p.char.art, p.char.color, p.pos));
   renderHud();
   say('Die Party beginnt! 🎉');
   city.overview(0, 1500);
@@ -461,7 +461,7 @@ async function playGame(players: Player[], rounds: number) {
     overlay.append(root);
     const winners = await runMinigame(
       root,
-      players.map((p) => ({ name: esc(p.name), emoji: p.char.emoji, color: p.char.color })),
+      players.map((p) => ({ name: esc(p.name), emoji: p.char.art, color: p.char.color })),
     );
     root.remove();
     winners.forEach((w) => addCoins(players[w], MINIGAME_PRIZE));
@@ -485,7 +485,7 @@ async function playGame(players: Player[], rounds: number) {
             (p, i) => `
           <div class="card rank" style="--c:${p.char.color}">
             <span class="place">${['🥇', '🥈', '🥉', '4.'][i]}</span>
-            <span class="avatar">${p.char.emoji}</span>
+            <span class="avatar">${p.char.art}</span>
             <div class="card-name">${esc(p.name)}<small>${p.char.name}</small></div>
             <div class="card-stats"><span>🍍 ${p.fruits}</span><span>🪙 ${p.coins}</span></div>
           </div>`,

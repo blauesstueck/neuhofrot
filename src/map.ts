@@ -277,13 +277,14 @@ export class CityMap {
     this.choiceMarkers = [];
   }
 
-  addToken(index: number, emoji: string, color: string, space: number) {
+  /** art = SVG-Markup der Figur (aus characters.ts) */
+  addToken(index: number, art: string, color: string, space: number) {
     const el = document.createElement('div');
     el.className = 'token';
     const inner = document.createElement('div');
     inner.className = 'token-inner';
     inner.style.background = color;
-    inner.textContent = emoji;
+    inner.innerHTML = art;
     el.append(inner);
     const marker = new maplibregl.Marker({ element: el, offset: TOKEN_OFFSETS[index] })
       .setLngLat(this.coords[space])
