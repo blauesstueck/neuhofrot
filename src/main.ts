@@ -1,7 +1,8 @@
 import './style.css';
 import { CHARACTERS, type Character } from './characters';
-import { SPACES, START_COINS, FRUIT_PRICE, BLUE_COINS, RED_COINS, LAP_BONUS, MINIGAME_PRIZE } from './board';
+import { board, NEUHOF, START_COINS, FRUIT_PRICE, BLUE_COINS, RED_COINS, LAP_BONUS, MINIGAME_PRIZE } from './board';
 import { CityMap } from './map';
+import { geocode, generateBoard } from './generate';
 import { runMinigame } from './minigames';
 
 interface Player {
@@ -22,7 +23,7 @@ const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 const panelPadding = () => (window.innerWidth > 900 ? 440 : 0);
 
 // Zum Testen: ?feld=3 startet alle Spieler auf Feld 3 statt am Rathaus.
-const DEBUG_START = Math.min(SPACES.length - 1, Math.max(0, +(new URLSearchParams(location.search).get('feld') ?? 0) || 0));
+const DEBUG_START = Math.max(0, +(new URLSearchParams(location.search).get('feld') ?? 0) || 0);
 
 // ---------------------------------------------------------------- Setup
 
@@ -31,27 +32,89 @@ const setup = {
   names: ['Niklas', 'Morris', 'Spieler 3', 'Spieler 4'],
   chars: [0, 1, 2, 3],
   rounds: 8,
+  place: NEUHOF.name,
+  /** Ort, für den das Brett gerade gebaut ist */
+  built: NEUHOF.name,
 };
 
 function renderSetup() {
   overlay.innerHTML = `
     <div class="panel setup">
       <h1 class="logo"><span>Neuhofrot</span> <span>Party</span> 🍍</h1>
-      <p class="sub">Das Brainrot-Brettspiel mitten durch 36119 Neuhof</p>
+      <p class="sub">Das Brainrot-Brettspiel mitten durch deinen Ort</p>
 
-      <h3>1 · Wer spielt mit?</h3>
+      <h3>1 · Wo wird gespielt?</h3>
+      <form id="place-form" class="row">
+        <input id="place" type="text" placeholder="PLZ und Ort, z. B. 36119 Neuhof" autocomplete="off" />
+        <button class="btn" type="submit">Bauen</button>
+      </form>
+      <div id="place-status" class="status"></div>
+
+      <h3>2 · Wer spielt mit?</h3>
       <div class="row seg" id="count">
         ${[2, 3, 4].map((n) => `<button type="button" data-n="${n}">${n} Spieler</button>`).join('')}
       </div>
       <div id="players"></div>
 
-      <h3>2 · Wie lange?</h3>
+      <h3>3 · Wie lange?</h3>
       <div class="row seg" id="rounds">
         ${[5, 8, 12].map((n) => `<button type="button" data-n="${n}">${n} Runden</button>`).join('')}
       </div>
 
       <button class="btn primary big-btn" id="start">Party starten!</button>
     </div>`;
+
+  const status = overlay.querySelector<HTMLElement>('#place-status')!;
+  const placeInput = overlay.querySelector<HTMLInputElement>('#place')!;
+  placeInput.value = setup.place;
+  const describe = () =>
+    board.streets
+      ? `✅ ${board.name} – ${board.spaces.length} Felder auf echten Straßen`
+      : `⚠️ ${board.name} – kein passendes Straßennetz gefunden, es gibt einen einfachen Rundkurs`;
+  status.textContent = describe();
+
+  let building: Promise<boolean> | null = null;
+  /** Baut das Brett für den eingegebenen Ort (falls es nicht schon steht). */
+  const buildPlace = (): Promise<boolean> => {
+    const q = placeInput.value.trim();
+    if (!q) {
+      status.textContent = 'Bitte erst PLZ und Ort eingeben.';
+      return Promise.resolve(false);
+    }
+    if (q.toLowerCase() === setup.built.toLowerCase()) return Promise.resolve(true);
+    building ??= (async () => {
+      try {
+        await city.ready;
+        if (q.toLowerCase() === NEUHOF.name.toLowerCase()) {
+          city.setBoard(NEUHOF);
+        } else {
+          status.textContent = '🔎 Suche Ort…';
+          const hit = await geocode(q);
+          if (!hit) {
+            status.textContent = '❌ Ort nicht gefunden – probier es mit PLZ und Ortsname.';
+            return false;
+          }
+          status.textContent = `🏗️ Baue Spielfeld in ${hit.name}…`;
+          city.setBoard(await generateBoard(city.map, hit));
+        }
+        setup.place = setup.built = q;
+        status.textContent = describe();
+        city.overview(panelPadding(), 2500);
+        return true;
+      } catch (err) {
+        console.error(err);
+        status.textContent = '❌ Ortssuche gerade nicht erreichbar – versuch es gleich nochmal.';
+        return false;
+      } finally {
+        building = null;
+      }
+    })();
+    return building;
+  };
+  overlay.querySelector('#place-form')!.addEventListener('submit', (e) => {
+    e.preventDefault();
+    void buildPlace();
+  });
 
   const syncSeg = () => {
     overlay.querySelectorAll<HTMLElement>('#count button').forEach((b) => b.classList.toggle('sel', +b.dataset.n! === setup.count));
@@ -110,13 +173,15 @@ function renderSetup() {
   overlay.querySelector('#start')!.addEventListener('click', async (e) => {
     const btn = e.currentTarget as HTMLButtonElement;
     btn.disabled = true;
-    await city.ready;
+    const ok = await buildPlace();
+    btn.disabled = false;
+    if (!ok) return;
     const players: Player[] = Array.from({ length: setup.count }, (_, i) => ({
       name: setup.names[i].trim() || `Spieler ${i + 1}`,
       char: CHARACTERS[setup.chars[i]],
       coins: START_COINS,
       fruits: 0,
-      pos: DEBUG_START,
+      pos: Math.min(board.spaces.length - 1, DEBUG_START),
     }));
     overlay.innerHTML = '';
     void playGame(players, setup.rounds);
@@ -213,7 +278,7 @@ async function playGame(players: Player[], rounds: number) {
   /** Abzweigung: Spieler wählt per Knopf, Wegweiser auf der Karte oder Zifferntaste. */
   const chooseBranch = (p: Player) =>
     new Promise<number>((resolve) => {
-      const options = SPACES[p.pos].next;
+      const options = board.spaces[p.pos].next;
       say(`🔀 ${esc(p.name)}, wohin soll's gehen?`);
       city.focus(p.pos, 600, 16.2);
       const done = (i: number) => {
@@ -239,7 +304,7 @@ async function playGame(players: Player[], rounds: number) {
 
   const moveFruit = async (avoid: number) => {
     let next = fruitSpace;
-    while (next === fruitSpace || next === avoid || next === 0) next = 1 + rand(SPACES.length - 1);
+    while (next === fruitSpace || next === avoid || next === 0) next = 1 + rand(board.spaces.length - 1);
     fruitSpace = next;
     city.setFruit(fruitSpace);
     city.focus(fruitSpace, 900);
@@ -267,9 +332,10 @@ async function playGame(players: Player[], rounds: number) {
 
   const runEvent = async (p: Player) => {
     const others = players.filter((o) => o !== p);
+    const town = board.name.replace(/^\d+\s+/, '');
     const events: (() => Promise<void> | void)[] = [
       () => {
-        say(`⛰️ Salz-Jackpot am Monte Kali! ${esc(p.name)} bekommt 10 🪙`);
+        say(`${board.neuhof ? '⛰️ Salz-Jackpot am Monte Kali' : `🎰 Jackpot in ${esc(town)}`}! ${esc(p.name)} bekommt 10 🪙`);
         addCoins(p, 10);
       },
       () => {
@@ -281,15 +347,15 @@ async function playGame(players: Player[], rounds: number) {
         addCoins(p, -5);
       },
       () => {
-        say(`🚂 Zug verpasst am Bahnhof Neuhof – ${esc(p.name)} zahlt 4 🪙 fürs Taxi`);
+        say(`🚂 Zug verpasst in ${esc(town)} – ${esc(p.name)} zahlt 4 🪙 fürs Taxi`);
         addCoins(p, -4);
       },
       () => {
-        say(`✈️ Bombardiro-Angriff über Neuhof! Alle anderen verlieren 3 🪙`);
+        say(`✈️ Bombardiro-Angriff über ${esc(town)}! Alle anderen verlieren 3 🪙`);
         others.forEach((o) => addCoins(o, -3));
       },
       async () => {
-        say(`🚒 Die Feuerwehr fährt ${esc(p.name)} zurück zum Rathaus: +${LAP_BONUS} 🪙`);
+        say(`🚒 Die Feuerwehr fährt ${esc(p.name)} zurück zum ${board.neuhof ? 'Rathaus' : 'Start'}: +${LAP_BONUS} 🪙`);
         p.pos = 0;
         await city.moveToken(players.indexOf(p), 0, 1100);
         addCoins(p, LAP_BONUS);
@@ -343,13 +409,13 @@ async function playGame(players: Player[], rounds: number) {
     await sleep(600);
 
     for (let left = n; left > 0; left--) {
-      const options = SPACES[p.pos].next;
+      const options = board.spaces[p.pos].next;
       p.pos = options.length > 1 ? await chooseBranch(p) : options[0].to;
       city.focus(p.pos, 320);
       await city.moveToken(i, p.pos);
       diceEl.textContent = left > 1 ? String(left - 1) : '';
       if (p.pos === 0) {
-        say(`🏁 Am Rathaus vorbei: +${LAP_BONUS} 🪙`);
+        say(`🏁 ${board.neuhof ? 'Am Rathaus' : 'Am Start'} vorbei: +${LAP_BONUS} 🪙`);
         addCoins(p, LAP_BONUS);
         await sleep(700);
       }
@@ -357,7 +423,7 @@ async function playGame(players: Player[], rounds: number) {
       await sleep(90);
     }
 
-    const type = SPACES[p.pos].type;
+    const type = board.spaces[p.pos].type;
     if (type === 'blue') {
       say(`🔵 Blaues Feld: +${BLUE_COINS} 🪙`);
       addCoins(p, BLUE_COINS);
@@ -437,3 +503,5 @@ async function playGame(players: Player[], rounds: number) {
 
 renderSetup();
 void city.ready.then(() => city.overview(panelPadding(), 4000));
+// Für die Browser-Konsole beim Entwickeln
+Object.assign(window, { city, getBoard: () => board });

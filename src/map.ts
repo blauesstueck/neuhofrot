@@ -1,6 +1,6 @@
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { SPACES, PATHS, LANDMARKS, CENTER, SPACE_COLORS, type Branch } from './board';
+import { board, setBoard, NEUHOF, SPACE_COLORS, type BoardData, type Branch } from './board';
 
 // OpenFreeMap: OpenStreetMap-Vektorkacheln inkl. 3D-Gebäuden, ohne API-Key.
 const STYLE = 'https://tiles.openfreemap.org/styles/liberty';
@@ -12,21 +12,24 @@ const TOKEN_OFFSETS: [number, number][] = [
   [16, 14],
 ];
 
-const M_LAT = 111320;
-const M_LNG = 111320 * Math.cos((CENTER[1] * Math.PI) / 180);
-
 /** Kreis (bzw. Ellipse) in Metern um einen Punkt, als Polygon-Ring */
 function ring(lng: number, lat: number, rx: number, ry = rx, steps = 28): [number, number][] {
+  const mLng = 111320 * Math.cos((lat * Math.PI) / 180);
   return Array.from({ length: steps + 1 }, (_, i) => {
     const a = (i / steps) * Math.PI * 2;
-    return [lng + (Math.cos(a) * rx) / M_LNG, lat + (Math.sin(a) * ry) / M_LAT] as [number, number];
+    return [lng + (Math.cos(a) * rx) / mLng, lat + (Math.sin(a) * ry) / 111320] as [number, number];
   });
 }
+
+const BOARD_LAYERS = ['kali', 'board-spaces', 'board-rim', 'board-path', 'board-path-casing'];
+const BOARD_SOURCES = ['kali', 'board-spaces', 'board-rim', 'board-path'];
 
 export class CityMap {
   readonly map: maplibregl.Map;
   readonly ready: Promise<void>;
-  readonly coords: [number, number][] = SPACES.map((s) => [s.lng, s.lat]);
+  coords: [number, number][] = [];
+  private boardMarkers: maplibregl.Marker[] = [];
+  private buildingFilters = new Map<string, unknown>();
   private tokens: { marker: maplibregl.Marker; inner: HTMLElement }[] = [];
   private fruit?: maplibregl.Marker;
   private choiceMarkers: maplibregl.Marker[] = [];
@@ -35,7 +38,7 @@ export class CityMap {
     this.map = new maplibregl.Map({
       container,
       style: STYLE,
-      center: CENTER,
+      center: NEUHOF.center,
       zoom: 14.6,
       pitch: 58,
       bearing: -20,
@@ -45,7 +48,7 @@ export class CityMap {
     this.ready = new Promise((resolve) =>
       this.map.once('load', () => {
         this.partyTheme();
-        this.buildBoard();
+        this.setBoard(NEUHOF);
         resolve();
       }),
     );
@@ -82,16 +85,35 @@ export class CityMap {
           30, '#d0b8ff',
         ]);
         map.setPaintProperty(layer.id, 'fill-extrusion-opacity', 0.95);
-        map.setFilter(layer.id, ['>', ['distance', { type: 'MultiLineString', coordinates: PATHS }], 7] as any);
+        this.buildingFilters.set(layer.id, map.getFilter(layer.id) ?? null);
       }
     } catch (err) {
       console.warn('Party-Look konnte nicht gesetzt werden', err);
     }
   }
 
-  /** Legt Wege, 3D-Felder, Schilder und den Monte Kali auf die Karte. */
-  private buildBoard() {
+  /** Wechselt das Brett: legt Wege, 3D-Felder und Schilder für den Ort neu auf die Karte. */
+  setBoard(next: BoardData) {
     const map = this.map;
+    setBoard(next);
+    this.reset();
+    this.boardMarkers.forEach((m) => m.remove());
+    this.boardMarkers = [];
+    for (const id of BOARD_LAYERS) if (map.getLayer(id)) map.removeLayer(id);
+    for (const id of BOARD_SOURCES) if (map.getSource(id)) map.removeSource(id);
+
+    const { spaces: SPACES, paths: PATHS, landmarks: LANDMARKS, center: CENTER } = board;
+    this.coords = SPACES.map((s) => [s.lng, s.lat]);
+
+    // Häuser, die direkt auf der Strecke stehen, ausblenden
+    this.buildingFilters.forEach((orig, id) => {
+      const far = ['>', ['distance', { type: 'MultiLineString', coordinates: PATHS }], 7];
+      try {
+        map.setFilter(id, (orig ? ['all', orig, far] : far) as any);
+      } catch (err) {
+        console.warn('Gebäudefilter nicht anwendbar', err);
+      }
+    });
 
     // Pixelbreite so skalieren, dass sie einer festen Breite in Metern entspricht.
     const meters = (m: number) => {
@@ -148,7 +170,33 @@ export class CityMap {
     });
 
     // Monte Kali: der weiße Kaliberg als Stufenkegel am Horizont
-    const kali = LANDMARKS.find((l) => l.name === 'Monte Kali')!;
+    const kali = LANDMARKS.find((l) => l.name === 'Monte Kali');
+    if (board.neuhof && kali) this.addKali(kali.lng, kali.lat);
+
+    SPACES.forEach((s, i) => {
+      const icon = s.type === 'event' ? '❓' : s.type === 'start' ? '🏁' : s.next.length > 1 ? '🔀' : '';
+      if (!icon) return;
+      const el = document.createElement('div');
+      el.className = 'space-icon';
+      el.textContent = icon;
+      this.boardMarkers.push(new maplibregl.Marker({ element: el }).setLngLat(this.coords[i]).addTo(map));
+    });
+
+    for (const l of LANDMARKS) {
+      const el = document.createElement('div');
+      el.className = 'landmark';
+      const icon = document.createElement('span');
+      icon.textContent = l.emoji;
+      const label = document.createElement('b');
+      label.textContent = l.name;
+      el.append(icon, label);
+      this.boardMarkers.push(new maplibregl.Marker({ element: el, anchor: 'bottom' }).setLngLat([l.lng, l.lat]).addTo(map));
+    }
+  }
+
+  private addKali(lng: number, lat: number) {
+    const map = this.map;
+    const kali = { lng, lat };
     map.addSource('kali', {
       type: 'geojson',
       data: {
@@ -173,22 +221,6 @@ export class CityMap {
         'fill-extrusion-base': ['get', 'base'],
       },
     });
-
-    SPACES.forEach((s, i) => {
-      const icon = s.type === 'event' ? '❓' : s.type === 'start' ? '🏁' : s.next.length > 1 ? '🔀' : '';
-      if (!icon) return;
-      const el = document.createElement('div');
-      el.className = 'space-icon';
-      el.textContent = icon;
-      new maplibregl.Marker({ element: el }).setLngLat(this.coords[i]).addTo(map);
-    });
-
-    for (const l of LANDMARKS) {
-      const el = document.createElement('div');
-      el.className = 'landmark';
-      el.innerHTML = `<span>${l.emoji}</span><b>${l.name}</b>`;
-      new maplibregl.Marker({ element: el, anchor: 'bottom' }).setLngLat([l.lng, l.lat]).addTo(map);
-    }
   }
 
   /** Entfernt Spielfiguren und Obst (für eine neue Partie). */
